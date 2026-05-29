@@ -42,6 +42,11 @@ import datetime
 import binascii
 import logging
 import subprocess
+import time
+import hashlib
+import zlib
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Tuple, Any, Iterator
 
 # ─────────────────────────────────────────────────────────────────
@@ -907,10 +912,19 @@ class IBDScanner:
 
 class ProcFdRescuer:
     """
-    DROP TABLE 后文件已从目录项删除，但若 mysqld 进程仍运行，
-    内核仍保留文件数据（文件引用计数 > 0）。
-    通过 /proc/<pid>/fd/<n> → (deleted) 找到句柄，直接读取字节流。
-    仅限 Linux。
+    DROP TABLE 后抢救数据。
+
+    策略层次（按优先级）：
+      1. /proc/<pid>/fd     — 已删除但未关闭的文件句柄（DROP TABLE 后通常已关闭）
+      2. /proc/<pid>/map_files — 内存映射的已删除文件（mmap 区域）
+      3. 裸盘扫描回退           — 以上均无效时建议
+
+    注意：MySQL 8.0 DROP TABLE 会调用 fil_delete_tablespace() 关闭句柄，
+    所以策略1通常无效。策略2（map_files）在以下情况有效：
+      - InnoDB buffer pool 使用 O_DIRECT 但未完全释放
+      - 其他进程持有该文件的 mmap
+
+    仅在 Linux 上可用。
     """
 
     @staticmethod
@@ -941,6 +955,9 @@ class ProcFdRescuer:
         """
         扫描 /proc/<pid>/fd，找到已删除的 .ibd 文件句柄。
         返回 [(fd_path, original_name), ...]
+
+        注意：DROP TABLE 后 MySQL 通常已关闭 .ibd 句柄，
+        此方法主要用于误 rm .ibd 文件的场景。
         """
         results = []
         fd_dir = f'/proc/{pid}/fd'
@@ -957,219 +974,979 @@ class ProcFdRescuer:
                     pass
         except PermissionError:
             logging.error(f"无权限读取 /proc/{pid}/fd，请用 root 运行")
+        except FileNotFoundError:
+            pass
         return results
+
+    @staticmethod
+    def find_mapped_deleted_ibd(pid: int, table_hint: str = '') -> List[Tuple[str, str]]:
+        """
+        扫描 /proc/<pid>/map_files，找到内存映射的已删除 .ibd 文件。
+
+        当 InnoDB 使用 O_DIRECT 打开 .ibd 文件后 DROP TABLE，
+        文件可能已经从目录项删除，但内核的 page cache 和 mmap
+        映射可能仍存在（取决于内核版本和配置）。
+
+        map_files 目录包含进程地址空间中每个映射区域的信息。
+        每个条目是一个符号链接，指向映射的文件路径。
+        """
+        results = []
+        map_dir = f'/proc/{pid}/map_files'
+        try:
+            entries = os.listdir(map_dir)
+        except (FileNotFoundError, PermissionError) as e:
+            logging.debug(f"无法访问 {map_dir}: {e}")
+            return results
+
+        for entry in entries:
+            try:
+                target = os.readlink(f'{map_dir}/{entry}')
+                # map_files 中的已删除文件也可能带 (deleted) 后缀
+                if ' (deleted)' in target and '.ibd' in target:
+                    orig = target.replace(' (deleted)', '')
+                    if table_hint and table_hint.lower() not in orig.lower():
+                        continue
+                    results.append((f'{map_dir}/{entry}', orig))
+            except Exception:
+                pass
+
+        return results
+
+    @staticmethod
+    def _try_read_mapped_file(map_entry: str) -> Optional[bytes]:
+        """
+        尝试通过 /proc/<pid>/mem 读取内存映射的文件数据。
+
+        从 map_files 条目（如 "7f1234000000-7f1235000000"）解析地址范围，
+        然后通过 /proc/<pid>/mem seek 到对应位置读取数据。
+
+        返回文件内容 bytes，失败返回 None。
+        """
+        parts = map_entry.split('/')[-1]  # "7f1234000000-7f1235000000"
+        try:
+            start_str, end_str = parts.split('-')
+            start = int(start_str, 16)
+            end = int(end_str, 16)
+            size = end - start
+            if size < UNIV_PAGE_SIZE or size > 10 * 1024 * 1024 * 1024:
+                return None
+        except (ValueError, AttributeError):
+            return None
+
+        pid = int(map_entry.split('/')[2])  # /proc/<pid>/map_files/...
+        mem_path = f'/proc/{pid}/mem'
+
+        try:
+            with open(mem_path, 'rb') as f:
+                # 只读前 1GB（避免超时）
+                read_size = min(size, 1024 * 1024 * 1024)
+                f.seek(start)
+                return f.read(read_size)
+        except Exception as e:
+            logging.debug(f"读取 /proc/{pid}/mem 失败: {e}")
+            return None
 
     @classmethod
     def rescue(cls, output_path: str, table_hint: str = '') -> Optional[str]:
         """
         自动找到被删除的 .ibd 并保存到 output_path。
-        成功返回 output_path，失败返回 None。
+
+        优先级：
+        1. /proc/<pid>/fd 中的 (deleted) 句柄
+        2. /proc/<pid>/map_files 中的内存映射
         """
         pids = cls.find_mysqld_pids()
         if not pids:
-            logging.warning("/proc/fd 方案：未找到 mysqld 进程")
+            logging.warning("未找到 mysqld 进程")
+            logging.warning("请确认：ps aux | grep mysqld")
             return None
 
+        logging.info(f"找到 {len(pids)} 个 mysqld 进程: PID={pids}")
+
+        # ── 策略1：/proc/<pid>/fd ──
         for pid in pids:
             deleted = cls.find_deleted_ibd(pid, table_hint)
-            if not deleted:
-                continue
+            if deleted:
+                logging.info(f"PID={pid} /proc/fd 中找到 {len(deleted)} 个已删除 .ibd")
+                for fd_path, orig_name in deleted:
+                    print(f"  [fd] {orig_name}")
 
-            logging.info(f"mysqld PID={pid} 持有 {len(deleted)} 个已删除 .ibd 句柄")
-            for fd_path, orig_name in deleted:
-                print(f"  [found] {orig_name}")
+                if len(deleted) > 1 and not table_hint:
+                    print("\n发现多个已删除 .ibd，请用 --table 指定表名过滤：")
+                    for _, orig in deleted:
+                        print(f"  --table {os.path.basename(orig).replace('.ibd','')}")
+                    return None
 
-            if len(deleted) > 1 and not table_hint:
-                print("发现多个已删除 .ibd，请用 --table 指定表名过滤，例如：")
-                for _, orig in deleted:
-                    print(f"  --table {os.path.basename(orig).replace('.ibd','')}")
-                return None
+                fd_path, orig_name = deleted[0]
+                return cls._copy_fd(fd_path, output_path)
 
-            fd_path, orig_name = deleted[0]
-            logging.info(f"从 {fd_path} 读取数据 → {output_path}")
-            try:
-                size = 0
-                with open(fd_path, 'rb') as src, open(output_path, 'wb') as dst:
-                    while True:
-                        chunk = src.read(4 * 1024 * 1024)  # 4MB 块
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                        size += len(chunk)
-                logging.info(f"抢救完成：{size / 1024 / 1024:.1f} MB → {output_path}")
-                return output_path
-            except PermissionError:
-                logging.error("读取 /proc/fd 失败：需要 root 权限")
-                return None
-            except Exception as e:
-                logging.error(f"读取失败：{e}")
-                return None
+        # ── 策略2：/proc/<pid>/map_files ──
+        for pid in pids:
+            mapped = cls.find_mapped_deleted_ibd(pid, table_hint)
+            if mapped:
+                logging.info(f"PID={pid} map_files 中找到 {len(mapped)} 个已删除 .ibd 映射")
+                for map_path, orig_name in mapped:
+                    print(f"  [map] {orig_name}")
 
-        logging.warning("在 mysqld 进程中未找到已删除的 .ibd 文件句柄")
+                if len(mapped) > 1 and not table_hint:
+                    print("\n发现多个内存映射 .ibd，请用 --table 指定表名过滤：")
+                    for _, orig in mapped:
+                        print(f"  --table {os.path.basename(orig).replace('.ibd','')}")
+                    return None
+
+                map_path, orig_name = mapped[0]
+                # 尝试通过 /proc/<pid>/mem 读取
+                data = cls._try_read_mapped_file(map_path)
+                if data:
+                    try:
+                        with open(output_path, 'wb') as f:
+                            f.write(data)
+                        logging.info(f"从内存映射抢救完成: {len(data)/1024/1024:.1f} MB → {output_path}")
+                        return output_path
+                    except Exception as e:
+                        logging.error(f"写入失败: {e}")
+                        return None
+                else:
+                    logging.warning(f"无法从内存映射读取数据")
+
+        # ── 均失败，给出诊断 ──
+        print()
+        print("=" * 60)
+        print("  未找到可恢复的数据源")
+        print("=" * 60)
+        print()
+        print("原因分析：")
+        print("  MySQL DROP TABLE 会立即关闭 .ibd 文件句柄并释放内存映射。")
+        print("  因此 /proc/<pid>/fd 和 /proc/<pid>/map_files 通常找不到数据。")
+        print()
+        print("恢复方案：")
+        print("  - 裸盘扫描（数据仍在磁盘上，只是文件系统元数据被释放）：")
+        print(f"    python {sys.argv[0]} --detect-device")
+        print(f"    python {sys.argv[0]} --device /dev/vda3 --quick-scan --workers 8")
+        print(f"    python {sys.argv[0]} --device /dev/vda3 --schema schema.json --workers 8 --relaxed -o recovered.sql")
+        print()
+        print("  或者使用 --auto-schema 自动从 SDI 页提取表结构：")
+        print(f"    python {sys.argv[0]} --device /dev/vda3 --auto-schema --table audit_logs -o recovered.sql")
+        print()
         return None
+
+    @staticmethod
+    def _copy_fd(fd_path: str, output_path: str) -> Optional[str]:
+        """从文件描述符复制数据到文件"""
+        try:
+            size = 0
+            with open(fd_path, 'rb') as src, open(output_path, 'wb') as dst:
+                while True:
+                    chunk = src.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    size += len(chunk)
+            logging.info(f"抢救完成: {size/1024/1024:.1f} MB → {output_path}")
+            return output_path
+        except PermissionError:
+            logging.error("读取 /proc/fd 失败：需要 root 权限")
+            return None
+        except Exception as e:
+            logging.error(f"读取失败: {e}")
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────
-# 裸块设备扫描器：DROP TABLE 且 mysqld 已重启时使用
+# SDI 自动提取器：从 MySQL 8.0 SDI 页提取表结构
+# ─────────────────────────────────────────────────────────────────
+
+class SDIExtractor:
+    """
+    从 MySQL 8.0 .ibd 文件或裸设备中提取 SDI（Serialized Dictionary
+    Information）JSON，自动获取表结构定义。
+
+    MySQL 8.0 在每个独立表空间的 .ibd 文件中存储 SDI 页（页类型 0x0045）。
+    SDI 页包含 zlib 压缩的 JSON，记录完整的表定义：
+      - 列名、类型、长度
+      - 是否可空、是否无符号
+      - 字符集
+      - 索引信息
+
+    使用场景：
+      1. --auto-schema：从 .ibd 或裸设备自动提取 schema，无需手写 schema.json
+      2. 裸盘恢复时先扫描 SDI 页获取表结构，再扫描 INDEX 页恢复数据
+    """
+
+    # SDI JSON 中包含的关键字段路径
+    # dd_object.columns[] → {name, type, is_nullable, is_unsigned,
+    #                        char_length, numeric_precision, collation_id, ...}
+
+    @staticmethod
+    def _find_sdi_pages_from_file(filepath: str, page_types: set = None) -> List[Tuple[int, bytes]]:
+        """
+        从 .ibd 文件或设备中提取所有 SDI 页（类型 0x0045）。
+
+        返回 [(page_offset, raw_16kb_page), ...]
+        """
+        if page_types is None:
+            page_types = {FIL_PAGE_SDI}  # 0x0045
+
+        results = []
+        page_sz = UNIV_PAGE_SIZE
+        # 每次读 64MB 大块
+        chunk_pages = (64 * 1024 * 1024) // page_sz
+
+        with open(filepath, 'rb') as f:
+            offset = 0
+            while True:
+                chunk = f.read(chunk_pages * page_sz)
+                if not chunk:
+                    break
+                n = len(chunk) // page_sz
+                for i in range(n):
+                    base = i * page_sz
+                    if base + 26 > len(chunk):
+                        break
+                    pt = struct.unpack_from('>H', chunk, base + FIL_PAGE_TYPE)[0]
+                    if pt in page_types:
+                        page_data = chunk[base:base + page_sz]
+                        if len(page_data) == page_sz:
+                            results.append((offset + base, bytes(page_data)))
+                offset += n * page_sz
+
+        return results
+
+    @staticmethod
+    def _decompress_sdi(raw_page: bytes) -> Optional[str]:
+        """
+        从 SDI 页中解压 JSON。
+
+        MySQL 8.0 的 SDI 页结构：
+          - FIL 头（38 字节）
+          - 页数据区：包含 zlib 压缩的 JSON BLOB
+
+        解压策略：
+        1. 在页数据区搜索 zlib magic bytes（0x78 0x01 / 0x78 0x9C / 0x78 0xDA）
+        2. 从 magic byte 位置开始尝试 zlib 解压
+        3. 验证解压结果是否为有效 JSON
+        """
+        # Zlib magic bytes
+        zlib_magics = [b'\x78\x01', b'\x78\x9C', b'\x78\xDA', b'\x78\x5E']
+
+        # 搜索范围：FIL_PAGE_DATA (38) 到页末
+        search_start = FIL_PAGE_DATA
+        search_end = UNIV_PAGE_SIZE - 4
+
+        best_json = None
+        best_len = 0
+
+        for magic in zlib_magics:
+            pos = search_start
+            while pos < search_end:
+                found = raw_page.find(magic, pos)
+                if found == -1:
+                    break
+
+                # 尝试从该位置解压
+                try:
+                    decompressed = zlib.decompress(raw_page[found:])
+                    text = decompressed.decode('utf-8', errors='replace')
+
+                    # 验证是否为有效 SDI JSON
+                    if text.strip().startswith('{') and '"dd_object_type"' in text:
+                        if len(text) > best_len:
+                            # 尝试解析 JSON 确认有效性
+                            try:
+                                json.loads(text)
+                                best_json = text
+                                best_len = len(text)
+                            except json.JSONDecodeError:
+                                pass
+                except (zlib.error, UnicodeDecodeError):
+                    pass
+
+                pos = found + 1
+
+        return best_json
+
+    @staticmethod
+    def _parse_sdi_columns(sdi_json: Dict) -> Optional[Tuple[str, str, List[Dict]]]:
+        """
+        从 SDI JSON 解析表结构。
+
+        返回 (table_name, row_format, columns_info_list)
+        其中 columns_info_list 每项为 {name, type, nullable, unsigned, charset}
+
+        SDI JSON 结构示例：
+        {
+          "dd_object": {
+            "name": "audit_logs",
+            "columns": [
+              {
+                "name": "id",
+                "type": 16,              # MYSQL_TYPE_LONGLONG
+                "is_nullable": false,
+                "is_unsigned": true,
+                "char_length": 20,
+                "numeric_precision": 0,
+                "collation_id": 0,
+                "is_explicit_collation": false
+              },
+              {
+                "name": "user_name",
+                "type": 16,              # MYSQL_TYPE_VARCHAR → 实际上是 MYSQL_TYPE_STRING?
+                "is_nullable": true,
+                "char_length": 64,
+                "collation_id": 45       # utf8mb4_general_ci
+              },
+              ...
+            ],
+            "options": "avg_row_length=0;key_block_size=0;...",
+            "partition_type": 0,
+            "row_format": 2,             # 2=DYNAMIC
+            ...
+          }
+        }
+        """
+        # MySQL internal type codes → SQL type name
+        # From MySQL source: include/mysql/com.h enum_field_types
+        MYSQL_TYPE_MAP_SDI = {
+            0:   ('decimal', 0),
+            1:   ('tinyint', 1),
+            2:   ('smallint', 2),
+            3:   ('int', 4),
+            4:   ('float', 4),
+            5:   ('double', 8),
+            6:   ('null', 0),
+            7:   ('timestamp', 4),
+            8:   ('bigint', 8),
+            9:   ('mediumint', 3),
+            10:  ('date', 3),
+            11:  ('time', 3),
+            12:  ('datetime', 8),
+            13:  ('year', 1),
+            14:  ('newdate', 3),
+            15:  ('varchar', 0),
+            16:  ('bit', 0),
+            17:  ('timestamp2', 4),
+            18:  ('datetime2', 8),
+            19:  ('time2', 3),
+            245: ('json', 0),
+            246: ('decimal', 0),
+            247: ('enum', 0),
+            248: ('set', 0),
+            249: ('tinyblob', 0),
+            250: ('mediumblob', 0),
+            251: ('longblob', 0),
+            252: ('blob', 0),
+            253: ('varchar', 0),
+            254: ('char', 0),
+            255: ('geometry', 0),
+        }
+
+        # Row format mapping
+        ROW_FORMAT_MAP = {0: 'REDUNDANT', 1: 'COMPACT', 2: 'DYNAMIC', 3: 'COMPRESSED'}
+
+        try:
+            dd = sdi_json.get('dd_object', {})
+            table_name = dd.get('name', 'unknown')
+            row_fmt_int = dd.get('row_format', 2)
+            row_format = ROW_FORMAT_MAP.get(row_fmt_int, 'DYNAMIC')
+
+            columns_info = []
+            for col in dd.get('columns', []):
+                col_type = col.get('type', 253)
+                type_info = MYSQL_TYPE_MAP_SDI.get(col_type, ('varchar', 0))
+                type_name = type_info[0]
+                char_len = col.get('char_length', 0)
+
+                # 构建 MySQL type 字符串
+                if type_name in ('varchar', 'char', 'varbinary', 'binary'):
+                    if char_len > 0:
+                        type_str = f'{type_name}({char_len})'
+                    else:
+                        type_str = type_name
+                elif type_name in ('decimal',):
+                    prec = col.get('numeric_precision', 10) or 10
+                    scale = col.get('numeric_scale', 0) or 0
+                    type_str = f'decimal({prec},{scale})'
+                elif type_name in ('tinyblob', 'mediumblob', 'longblob', 'blob'):
+                    type_str = type_name
+                elif type_name in ('enum', 'set'):
+                    # 无法从 SDI 获取枚举值，标记为基础类型
+                    type_str = type_name
+                else:
+                    type_str = type_name
+
+                # 字符集检测
+                charset = 'utf8mb4'
+                collation_id = col.get('collation_id', 0)
+                if collation_id:
+                    # 常见 collation id 映射
+                    COLLATION_MAP = {
+                        8: 'latin1', 9: 'latin1',
+                        33: 'utf8mb3', 45: 'utf8mb4', 46: 'utf8mb4',
+                        63: 'binary', 83: 'utf8', 192: 'utf8mb3',
+                        224: 'utf8mb4', 225: 'utf8mb4',
+                    }
+                    charset = COLLATION_MAP.get(collation_id, 'utf8mb4')
+
+                nullable = col.get('is_nullable', True)
+                unsigned = col.get('is_unsigned', False)
+
+                columns_info.append({
+                    'name': col.get('name', f'col_{len(columns_info)}'),
+                    'type': type_str,
+                    'nullable': nullable,
+                    'unsigned': unsigned,
+                    'charset': charset,
+                })
+
+            return table_name, row_format, columns_info
+
+        except Exception as e:
+            logging.error(f"解析 SDI JSON 失败: {e}")
+            return None
+
+    @classmethod
+    def extract_schema_from_file(cls, filepath: str,
+                                  table_filter: str = '') -> Optional[Tuple[str, str, List[Dict]]]:
+        """
+        从 .ibd 文件或设备中提取所有 SDI 表结构。
+        如果指定 table_filter，只返回匹配的表。
+
+        返回 (table_name, row_format, columns_info_list)
+        """
+        sdi_pages = cls._find_sdi_pages_from_file(filepath, {FIL_PAGE_SDI})
+
+        if not sdi_pages:
+            logging.info(f"未在 {filepath} 中找到 SDI 页")
+            return None
+
+        logging.info(f"找到 {len(sdi_pages)} 个 SDI 页")
+
+        for offset, raw_page in sdi_pages:
+            json_text = cls._decompress_sdi(raw_page)
+            if json_text is None:
+                continue
+
+            try:
+                sdi_obj = json.loads(json_text)
+            except json.JSONDecodeError:
+                continue
+
+            result = cls._parse_sdi_columns(sdi_obj)
+            if result is None:
+                continue
+
+            table_name, row_format, columns_info = result
+            if table_filter and table_filter.lower() not in table_name.lower():
+                continue
+
+            logging.info(f"SDI 提取成功: 表={table_name}, "
+                         f"行格式={row_format}, 列数={len(columns_info)}")
+            for ci in columns_info:
+                logging.debug(f"  {ci['name']}: {ci['type']} "
+                              f"{'UNSIGNED' if ci['unsigned'] else ''} "
+                              f"{'NULL' if ci['nullable'] else 'NOT NULL'} "
+                              f"{ci['charset']}")
+
+            return table_name, row_format, columns_info
+
+        logging.warning(f"未能从 SDI 页中提取表结构{' (filter=' + table_filter + ')' if table_filter else ''}")
+        return None
+
+    @classmethod
+    def extract_schema_from_device(cls, device: str, table_filter: str = '',
+                                    offset_mb: int = 0, length_mb: int = 0,
+                                    workers: int = 4) -> Optional[Tuple[str, str, List[Dict]]]:
+        """
+        从裸块设备扫描 SDI 页并提取表结构。
+
+        先快速预扫描找 SDI 候选位置，再深度解压。
+        """
+        # 使用 CandidateScanner 快速定位 SDI 页
+        scanner = CandidateScanner(
+            device=device,
+            read_chunk_mb=64,
+            page_types=[FIL_PAGE_SDI],
+        )
+
+        start_bytes = offset_mb * 1024 * 1024
+        length_bytes = length_mb * 1024 * 1024 if length_mb else 0
+        candidates = scanner.quick_scan(
+            start_byte=start_bytes,
+            length_bytes=length_bytes,
+            workers=workers,
+        )
+
+        if not candidates:
+            logging.warning(f"未在设备 {device} 上找到 SDI 页")
+            return None
+
+        logging.info(f"找到 {len(candidates)} 个 SDI 候选页，开始提取表结构...")
+
+        page_sz = UNIV_PAGE_SIZE
+        for byte_off, _, _ in candidates:
+            try:
+                with open(device, 'rb') as f:
+                    f.seek(byte_off)
+                    raw_page = f.read(page_sz)
+                if len(raw_page) < page_sz:
+                    continue
+
+                json_text = cls._decompress_sdi(raw_page)
+                if json_text is None:
+                    continue
+
+                try:
+                    sdi_obj = json.loads(json_text)
+                except json.JSONDecodeError:
+                    continue
+
+                result = cls._parse_sdi_columns(sdi_obj)
+                if result is None:
+                    continue
+
+                table_name, row_format, columns_info = result
+                if table_filter and table_filter.lower() not in table_name.lower():
+                    continue
+
+                logging.info(f"SDI 提取成功: 表={table_name}, "
+                             f"行格式={row_format}, 列数={len(columns_info)}")
+                return table_name, row_format, columns_info
+
+            except Exception as e:
+                logging.debug(f"SDI 页 offset={byte_off} 解析失败: {e}")
+                continue
+
+        logging.warning("未能从任何 SDI 页提取表结构")
+        return None
+
+    @classmethod
+    def generate_schema_json(cls, table_name: str, row_format: str,
+                              columns_info: List[Dict], output_path: str):
+        """将提取的表结构写入 schema.json 文件"""
+        schema = {
+            'table': table_name,
+            'row_format': row_format,
+            'columns': columns_info,
+            '_auto_generated': True,
+            '_source': 'MySQL 8.0 SDI',
+        }
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(schema, f, indent=2, ensure_ascii=False)
+        logging.info(f"Schema 已写入: {output_path}")
+
+    @classmethod
+    def columns_to_columndefs(cls, columns_info: List[Dict]) -> List:
+        """将 SDI 提取的列信息转换为 ColumnDef 对象列表"""
+        coldefs = []
+        for ci in columns_info:
+            type_full = ci['type']
+            length = 0
+            if '(' in type_full:
+                try:
+                    length_str = type_full.split('(')[1].rstrip(')')
+                    if ',' in length_str:
+                        prec = int(length_str.split(',')[0].strip())
+                        length = (prec // 2) + 1 + 4
+                    else:
+                        length = int(length_str.strip())
+                except Exception:
+                    length = 0
+
+            coldefs.append(ColumnDef(
+                name=ci['name'],
+                type_str=type_full,
+                length=length,
+                nullable=ci.get('nullable', True),
+                unsigned=ci.get('unsigned', False),
+                charset=ci.get('charset', 'utf8mb4'),
+            ))
+        return coldefs
+
+
+# ─────────────────────────────────────────────────────────────────
+# 轻量级预扫描器：快速定位 InnoDB 页的候选位置
+# ─────────────────────────────────────────────────────────────────
+
+# InnoDB 页类型特征值（偏移 24-25，大端序）
+INNODB_PAGE_TYPES = {
+    0x45BF: 'INDEX',
+    0x45BE: 'RTREE',
+    0x45BD: 'UNDO_LOG',
+    0x0045: 'SDI',
+    0x000A: 'BLOB',
+    0x000B: 'ZBLOB',
+    0x000C: 'ZBLOB2',
+    0x0002: 'UNDO',
+    0x0003: 'INODE',
+    0x0006: 'SYS',
+    0x0007: 'TRX_SYS',
+    0x0008: 'FSP_HDR',
+    0x0009: 'XDES',
+}
+
+# InnoDB 校验和算法 (crc32 magic: 0x6854C878 / 0x87785768)
+CRC32_MAGIC = 0x87785768  # 小端序存储
+INNODB_MAGIC_N = 0  # none checksum magic
+
+class CandidateScanner:
+    """
+    轻量级预扫描：只读每 16KB 边界的页类型（2 字节）+ 校验和（4 字节），
+    快速找出可能是 InnoDB 页的候选位置。
+
+    阶段1（快速）：按 16KB 步长扫描，只读 6 字节/16KB（页类型 + 校验和）
+    阶段2（深度）：对候选位置读取完整 16KB 并解析记录
+    """
+
+    def __init__(self, device: str, read_chunk_mb: int = 64,
+                 page_types: List[int] = None,
+                 require_checksum: bool = False):
+        self.device = device
+        self.chunk_size = read_chunk_mb * 1024 * 1024
+        self.page_sz = UNIV_PAGE_SIZE
+        self.page_types = page_types or [FIL_PAGE_INDEX, 0x000A]  # 默认找 INDEX + BLOB
+        self.require_checksum = require_checksum  # 快速模式关闭，深度模式可选
+        self._size = os.path.getsize(device)
+
+    @property
+    def total_pages(self) -> int:
+        return self._size // self.page_sz
+
+    def quick_scan(self, start_byte: int = 0, length_bytes: int = 0,
+                   workers: int = 4) -> List[Tuple[int, int, int]]:
+        """
+        快速预扫描：多线程检查每个 16KB 边界。
+
+        返回 [(byte_offset, page_type, checksum), ...]
+        每个候选只需读取 6 字节（页类型2B + 校验和4B），而不是 16KB。
+
+        workers: 并行扫描线程数
+        """
+        if length_bytes <= 0:
+            length_bytes = self._size - start_byte
+        end_byte = start_byte + length_bytes
+        if end_byte > self._size:
+            end_byte = self._size
+
+        total = (end_byte - start_byte) // self.page_sz
+        logging.info(f"预扫描: {total:,} 页候选 ({length_bytes/1024**3:.2f} GB)，{workers} 线程并行")
+
+        # 分块
+        chunk_pages = total // workers + 1
+        chunks = []
+        for i in range(workers):
+            cs = start_byte + i * chunk_pages * self.page_sz
+            ce = min(cs + chunk_pages * self.page_sz, end_byte)
+            if cs >= ce:
+                break
+            chunks.append((cs, ce))
+
+        candidates = []
+        t0 = time.time()
+        pages_done = [0]
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(self._quick_scan_chunk, cs, ce, pages_done): (cs, ce)
+                      for cs, ce in chunks}
+
+            for fut in as_completed(futures):
+                results = fut.result()
+                candidates.extend(results)
+
+        elapsed = time.time() - t0
+        rate = total / elapsed if elapsed > 0 else 0
+        logging.info(f"预扫描完成: 耗时 {elapsed:.1f}s，"
+                     f"速率 {rate:,.0f} 页/秒，"
+                     f"候选 {len(candidates):,} 个")
+
+        # 按类型统计
+        type_counts = {}
+        for _, pt, _ in candidates:
+            name = INNODB_PAGE_TYPES.get(pt, f'0x{pt:04X}')
+            type_counts[name] = type_counts.get(name, 0) + 1
+        for name, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+            logging.info(f"  {name:<12} {cnt:>8,} 页")
+
+        return candidates
+
+    def _quick_scan_chunk(self, start_byte: int, end_byte: int,
+                          pages_done: list) -> List[Tuple[int, int, int]]:
+        """扫描一个块，返回候选位置列表"""
+        results = []
+        page_sz = self.page_sz
+        buf_size = self.chunk_size
+        # 确保 buf_size 是 page_sz 的整数倍
+        buf_pages = buf_size // page_sz
+        buf_size = buf_pages * page_sz
+
+        type_set = set(self.page_types)
+
+        with open(self.device, 'rb') as f:
+            f.seek(start_byte)
+            offset = start_byte
+            while offset < end_byte:
+                read_size = min(buf_size, end_byte - offset)
+                chunk = f.read(read_size)
+                if not chunk:
+                    break
+                n = len(chunk) // page_sz
+                for i in range(n):
+                    p_off = offset + i * page_sz
+                    base = i * page_sz
+                    if base + 28 > len(chunk):
+                        break
+                    page_type = struct.unpack_from('>H', chunk, base + FIL_PAGE_TYPE)[0]
+                    if page_type in type_set:
+                        checksum = struct.unpack_from('>I', chunk, base + FIL_PAGE_SPACE_OR_CHKSUM)[0]
+                        results.append((p_off, page_type, checksum))
+                    pages_done[0] += 1
+                offset += n * page_sz
+
+                # 进度报告（只由线程0报告，避免竞争）
+                if pages_done[0] % 500000 < n:
+                    pass  # 由主线程统一报告
+
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────
+# 裸块设备扫描器 v2：预扫描 + 多线程深度解析
 # ─────────────────────────────────────────────────────────────────
 
 class RawDeviceScanner:
     """
     直接扫描块设备（/dev/sda1、/dev/vda3 等）或磁盘镜像文件，
-    按 UNIV_PAGE_SIZE(16KB) 步长寻找 InnoDB FIL_PAGE_INDEX 页，
-    不依赖 .ibd 文件存在。
+    按 UNIV_PAGE_SIZE(16KB) 步长寻找 InnoDB INDEX 页。
 
-    这是 undrop-for-innodb 的核心思路：
-      文件删除 → 目录项消失 → 磁盘块仍保留 → 按特征扫描
+    改进 v2:
+    - 预扫描模式（--quick-scan）：只读页类型快速定位候选区
+    - 多线程深度解析（--workers N）
+    - 宽松检测模式（--relaxed）：不过滤 page_level，放宽 n_heap 限制
+    - 增量进度（速率 + ETA）
     """
 
-    # InnoDB 页特征：偏移 24-25 为页类型
-    PAGE_TYPE_OFFSET = FIL_PAGE_TYPE   # 24
+    PAGE_TYPE_OFFSET = FIL_PAGE_TYPE
 
     def __init__(self, device: str, columns: List[ColumnDef],
                  row_format: str = 'DYNAMIC',
                  include_deleted: bool = True,
                  space_id: int = 0,
-                 read_chunk_mb: int = 64):
+                 read_chunk_mb: int = 64,
+                 workers: int = 4,
+                 relaxed: bool = False,
+                 candidates: List[Tuple[int, int, int]] = None):
         self.device = device
         self.columns = columns
         self.row_format = row_format.upper()
         self.include_deleted = include_deleted
-        self.space_id = space_id           # 0 = 不过滤 space_id
+        self.space_id = space_id
         self.chunk_size = read_chunk_mb * 1024 * 1024
+        self.workers = workers
+        self.relaxed = relaxed
+        self._candidates = candidates  # 预扫描结果
 
         if not os.path.exists(device):
             raise FileNotFoundError(f"设备/文件不存在: {device}")
 
-    def _iter_pages(self) -> Iterator[Tuple[int, bytes]]:
-        """
-        按 16KB 步长遍历设备/文件，yield (page_offset_bytes, raw_bytes)。
-        使用大块读取减少 I/O 次数。
-        """
-        page_sz = UNIV_PAGE_SIZE
-        buf_pages = self.chunk_size // page_sz
+        self._size = os.path.getsize(device)
 
-        with open(self.device, 'rb') as f:
-            offset = 0
-            while True:
-                chunk = f.read(buf_pages * page_sz)
-                if not chunk:
-                    break
-                n = len(chunk) // page_sz
-                for i in range(n):
-                    yield offset + i * page_sz, chunk[i * page_sz:(i + 1) * page_sz]
-                offset += n * page_sz
+    def _is_innodb_index_page(self, raw: bytes) -> Tuple[bool, str]:
+        """
+        判断是否为可恢复的 InnoDB 页。
+        返回 (is_valid, reason)。
 
-    def _is_innodb_index_page(self, raw: bytes) -> bool:
-        """快速判断是否为 InnoDB INDEX 叶子页"""
+        宽松模式：接受所有 INDEX 页 + BLOB 页，不限 level，n_heap 上限 50000。
+        严格模式：只接受 level==0，n_heap 2-2000。
+        """
         if len(raw) < UNIV_PAGE_SIZE:
-            return False
+            return False, "too_short"
+
         page_type = read_u16_be(raw, FIL_PAGE_TYPE)
-        if page_type != FIL_PAGE_INDEX:
-            return False
+
+        # 接受 INDEX 页和 BLOB 页（BLOB 页含溢出字段数据）
+        if page_type == FIL_PAGE_INDEX:
+            pass
+        elif page_type in (0x000A, 0x000B, 0x000C):  # BLOB/ZBLOB/ZBLOB2
+            return True, "BLOB"
+        else:
+            return False, f"type=0x{page_type:04X}"
+
         # 过滤 space_id
         if self.space_id:
-            sid = struct.unpack_from('>I', raw, FIL_PAGE_ARCH_LOG_NO)[0]
+            sid = read_u32_be(raw, FIL_PAGE_ARCH_LOG_NO)
             if sid != self.space_id:
-                return False
-        # 必须是叶子页（level == 0）
-        level = read_u16_be(raw, FIL_PAGE_DATA + PAGE_LEVEL)
-        if level != 0:
-            return False
-        # N_HEAP 合法性（bit15 = compact flag）
-        n_heap = read_u16_be(raw, FIL_PAGE_DATA + PAGE_N_HEAP) & 0x7FFF
-        if n_heap < 2 or n_heap > 2000:
-            return False
-        return True
+                return False, "space_id_mismatch"
 
-    def scan(self) -> List[Dict]:
+        # 页级别检查
+        level = read_u16_be(raw, FIL_PAGE_DATA + PAGE_LEVEL)
+
+        # N_HEAP 合法性
+        n_heap_raw = read_u16_be(raw, FIL_PAGE_DATA + PAGE_N_HEAP)
+        n_heap = n_heap_raw & 0x7FFF
+
+        if self.relaxed:
+            if n_heap < 2 or n_heap > 50000:
+                return False, f"n_heap={n_heap}"
+        else:
+            if n_heap < 2 or n_heap > 2000:
+                return False, f"n_heap={n_heap}"
+            if level != 0:
+                return False, f"level={level}"
+
+        # 额外验证：heap_top 应合理
+        heap_top = read_u16_be(raw, FIL_PAGE_DATA + PAGE_HEAP_TOP)
+        if heap_top < FIL_PAGE_DATA + PAGE_HEADER_SIZE + 38:
+            return False, "heap_top_too_low"
+        if heap_top > UNIV_PAGE_SIZE:
+            return False, "heap_top_overflow"
+
+        return True, f"level={level}"
+
+    def _parse_one_page(self, raw: bytes, byte_offset: int) -> Tuple[List[Dict], int]:
+        """深度解析一页，返回 (rows, page_type)"""
+        page_type = read_u16_be(raw, FIL_PAGE_TYPE)
+        page_no = byte_offset // UNIV_PAGE_SIZE
+        rows = []
+
+        try:
+            page = InnoDBPage(raw, page_no)
+            parser = RecordParser(page, self.columns,
+                                  include_deleted=self.include_deleted)
+
+            if page_type == FIL_PAGE_INDEX:
+                page_rows = parser.scan_page()
+                if not page_rows:
+                    page_rows = parser.scan_page_brute_force()
+                for r in page_rows:
+                    r['page_no'] = page_no
+                    r['device_offset'] = byte_offset
+                rows = page_rows
+            elif page_type in (0x000A, 0x000B, 0x000C):
+                # BLOB 页：尝试暴力扫描（部分文本/VARCHAR 溢出数据）
+                page_rows = parser.scan_page_brute_force()
+                for r in page_rows:
+                    r['page_no'] = page_no
+                    r['device_offset'] = byte_offset
+                    r['_is_blob_page'] = True
+                rows = page_rows
+        except Exception as e:
+            logging.debug(f"解析页 offset={byte_offset} 失败: {e}")
+
+        return rows, page_type
+
+    def _deep_scan_candidates(self, candidate_list: List[Tuple[int, int, int]]) -> List[Dict]:
         """
-        扫描整个设备，返回所有恢复的行。
+        多线程深度解析候选页。
+        candidate_list: [(byte_offset, page_type, checksum), ...]
         """
         all_rows = []
         seen_keys = set()
-        pages_checked = 0
-        pages_matched = 0
+        total = len(candidate_list)
 
-        logging.info(f"裸盘扫描: {self.device}，行格式: {self.row_format}")
-        logging.info("注意：扫描大磁盘可能需要数分钟到数小时，建议指定 --offset / --length 缩小范围")
+        if total == 0:
+            return all_rows
 
-        for byte_offset, raw in self._iter_pages():
-            pages_checked += 1
-            if pages_checked % 100000 == 0:
-                gb = byte_offset / 1024**3
-                logging.info(f"已扫描 {gb:.2f} GB，匹配页: {pages_matched}，"
-                             f"已恢复: {len(all_rows)} 条")
+        logging.info(f"深度解析 {total:,} 个候选页，{self.workers} 线程并行...")
 
-            if not self._is_innodb_index_page(raw):
-                continue
+        # 创建索引页候选（优先处理）和 BLOB 页候选
+        index_candidates = [c for c in candidate_list if c[1] == FIL_PAGE_INDEX]
+        other_candidates = [c for c in candidate_list if c[1] != FIL_PAGE_INDEX]
 
-            pages_matched += 1
-            page_no_in_file = byte_offset // UNIV_PAGE_SIZE
+        # 优先处理 INDEX 页
+        all_candidates = index_candidates + other_candidates
+        chunk_size = max(1, len(all_candidates) // self.workers)
+        chunks = [all_candidates[i:i + chunk_size] for i in range(0, len(all_candidates), chunk_size)]
 
-            try:
-                page = InnoDBPage(raw, page_no_in_file)
-                parser = RecordParser(page, self.columns,
-                                      include_deleted=self.include_deleted)
-                rows = parser.scan_page()
-                if not rows:
-                    rows = parser.scan_page_brute_force()
+        t0 = time.time()
+        processed = [0]
 
-                for r in rows:
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futures = {ex.submit(self._deep_scan_chunk, chunk, processed, total): i
+                      for i, chunk in enumerate(chunks)}
+
+            for fut in as_completed(futures):
+                rows_from_chunk = fut.result()
+                for r in rows_from_chunk:
                     key = IBDScanner._row_key(r['row'])
                     if key not in seen_keys:
                         seen_keys.add(key)
-                        r['page_no'] = page_no_in_file
-                        r['device_offset'] = byte_offset
                         all_rows.append(r)
-            except Exception as e:
-                logging.debug(f"解析页 offset={byte_offset} 失败: {e}")
 
-        logging.info(f"裸盘扫描完成：检查 {pages_checked} 页，"
-                     f"匹配 {pages_matched} 个 INDEX 页，"
+        elapsed = time.time() - t0
+        pps = total / elapsed if elapsed > 0 else 0
+        logging.info(f"深度解析完成: 耗时 {elapsed:.1f}s，"
+                     f"速率 {pps:,.0f} 页/秒，"
                      f"恢复 {len(all_rows)} 条记录")
         return all_rows
 
-    def scan_range(self, start_byte: int, length_bytes: int) -> List[Dict]:
-        """
-        只扫描指定字节范围（用于缩小范围、加速）。
-        start_byte 和 length_bytes 都需要是 16384 的倍数。
-        """
-        all_rows = []
-        seen_keys = set()
+    def _deep_scan_chunk(self, candidates: List[Tuple[int, int, int]],
+                         processed: list, total: int) -> List[Dict]:
+        """深度解析一批候选页（在线程中运行）"""
+        results = []
         page_sz = UNIV_PAGE_SIZE
-        start_page = start_byte // page_sz
-        end_page   = (start_byte + length_bytes) // page_sz
-
-        logging.info(f"范围扫描: offset={start_byte}({start_byte//1024//1024}MB) "
-                     f"length={length_bytes//1024//1024}MB")
 
         with open(self.device, 'rb') as f:
-            f.seek(start_byte)
-            for pg in range(start_page, end_page):
-                raw = f.read(page_sz)
-                if len(raw) < page_sz:
-                    break
-                if not self._is_innodb_index_page(raw):
-                    continue
+            for byte_off, page_type, _checksum in candidates:
                 try:
-                    page = InnoDBPage(raw, pg)
-                    parser = RecordParser(page, self.columns,
-                                         include_deleted=self.include_deleted)
-                    rows = parser.scan_page()
-                    if not rows:
-                        rows = parser.scan_page_brute_force()
-                    for r in rows:
-                        key = IBDScanner._row_key(r['row'])
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            r['page_no'] = pg
-                            all_rows.append(r)
+                    f.seek(byte_off)
+                    raw = f.read(page_sz)
+                    if len(raw) < page_sz:
+                        continue
+
+                    is_valid, reason = self._is_innodb_index_page(raw)
+                    if not is_valid:
+                        continue
+
+                    rows, _ = self._parse_one_page(raw, byte_off)
+                    results.extend(rows)
                 except Exception:
                     pass
 
-        logging.info(f"范围扫描完成，恢复 {len(all_rows)} 条")
-        return all_rows
+                processed[0] += 1
+                # 每处理 1000 个报告一次进度
+                if processed[0] % 1000 == 0:
+                    logging.debug(f"深度解析进度: {processed[0]:,}/{total:,}")
+
+        return results
+
+    def scan(self) -> List[Dict]:
+        """
+        扫描整个设备。
+
+        流程：
+        1. 如果没有候选列表 → 先做预扫描
+        2. 对候选页做多线程深度解析（自动过滤无效页）
+        """
+        if self._candidates is None:
+            scanner = CandidateScanner(
+                device=self.device,
+                read_chunk_mb=self.chunk_size // (1024 * 1024),
+                page_types=[FIL_PAGE_INDEX, 0x000A, 0x000B, 0x000C],
+            )
+            self._candidates = scanner.quick_scan(workers=self.workers)
+
+        logging.info(f"预扫描候选 {len(self._candidates):,} 个 → "
+                     f"进入深度解析")
+        return self._deep_scan_candidates(self._candidates)
+
+    def scan_range(self, start_byte: int, length_bytes: int) -> List[Dict]:
+        """
+        只扫描指定字节范围。
+        """
+        scanner = CandidateScanner(
+            device=self.device,
+            read_chunk_mb=self.chunk_size // (1024 * 1024),
+            page_types=[FIL_PAGE_INDEX, 0x000A, 0x000B, 0x000C],
+        )
+        candidates = scanner.quick_scan(
+            start_byte=start_byte,
+            length_bytes=length_bytes,
+            workers=self.workers,
+        )
+
+        logging.info(f"范围 {start_byte/1024**2:.0f}MB - "
+                     f"{(start_byte+length_bytes)/1024**2:.0f}MB: "
+                     f"候选 {len(candidates)} 个")
+        return self._deep_scan_candidates(candidates)
 
 
 def detect_mysql_datadir() -> str:
@@ -1315,25 +2092,25 @@ def main():
 【场景1】DROP TABLE / DELETE 后 .ibd 仍存在（文件未被覆盖）：
   python innodb_recovery.py --ibd orders.ibd --schema schema.json --brute-force -o out.sql
 
-【场景2】DROP TABLE 后 mysqld 进程仍在运行（/proc/fd 抢救，成功率最高）：
-  python innodb_recovery.py --rescue --table orders --schema schema.json -o out.sql
-  # 工具自动从 /proc/<mysqld_pid>/fd 读取已删除文件，无需 .ibd 存在
+【场景2】mysqld 已重启 / .ibd 彻底删除 — 裸盘扫描 + SDI 自动提取（推荐）：
+  # 一步到位（自动从 SDI 提取表结构，无需手写 schema.json）
+  python innodb_recovery.py --device /dev/vda3 --auto-schema --table orders \\
+      --workers 8 --relaxed -o recovered.sql
+  # 或先预扫描定位，再精准恢复
+  python innodb_recovery.py --device /dev/vda3 --quick-scan --workers 8
+  python innodb_recovery.py --device /dev/vda3 --auto-schema --table orders \\
+      --offset 18300 --length 1200 --workers 8 --relaxed -o recovered.sql
 
-【场景3】mysqld 已重启 / .ibd 已删除，扫描裸块设备（需 root）：
-  python innodb_recovery.py --device /dev/sda1 --schema schema.json -o out.sql
-  # 扫描大磁盘时可加 --offset / --length 缩小范围（单位 MB）
+【场景3】手动 schema 方式裸盘扫描（传统方式）：
   python innodb_recovery.py --device /dev/sda1 --schema schema.json \\
-      --offset 10240 --length 20480 -o out.sql
+      --workers 8 --relaxed -o out.sql
 
-【其他】
-  # 生成表结构模板
+【场景4】检测设备 & 生成 schema 模板：
+  python innodb_recovery.py --detect-device
   python innodb_recovery.py --gen-schema orders --schema-out schema.json
 
-  # 查看页分布（.ibd 存在时）
+【场景5】查看页分布（.ibd 存在时）：
   python innodb_recovery.py --ibd orders.ibd --page-info
-
-  # 自动检测 MySQL 数据目录所在磁盘（辅助信息）
-  python innodb_recovery.py --detect-device
 
 注意：裸盘扫描和 /proc/fd 抢救均需 root 权限。
         """
@@ -1348,6 +2125,8 @@ def main():
 
     # ── 通用参数 ──
     parser.add_argument('--schema',   help='表结构 JSON 文件路径')
+    parser.add_argument('--auto-schema', action='store_true',
+                        help='自动从 MySQL 8.0 SDI 页提取表结构（无需手动写 schema.json）')
     parser.add_argument('--table',    help='表名（用于 --rescue 时过滤，或生成输出文件名）')
     parser.add_argument('-o', '--output', help='输出文件路径（默认 stdout）')
     parser.add_argument('--format',   choices=['sql', 'csv', 'json'],
@@ -1368,6 +2147,12 @@ def main():
                         help='只匹配指定 InnoDB space_id 的页（0=不过滤）')
     parser.add_argument('--read-chunk', type=int, default=64,
                         help='裸盘每次读取块大小（MB，默认64）')
+    parser.add_argument('--workers',  type=int, default=4,
+                        help='并行扫描线程数（默认4）')
+    parser.add_argument('--quick-scan', action='store_true',
+                        help='快速预扫描模式：只定位 InnoDB 页位置，不做深度恢复（用于评估）')
+    parser.add_argument('--relaxed', action='store_true',
+                        help='宽松检测模式：接受所有 INDEX/BLOB 页（不限 level），放宽 n_heap 限制')
 
     # ── 辅助命令 ──
     parser.add_argument('--gen-schema', metavar='TABLE_NAME',
@@ -1405,6 +2190,51 @@ def main():
             print("未能自动检测 MySQL 数据目录，请手动运行：df -h /var/lib/mysql")
         return
 
+    # ── 快速预扫描（不需要 schema） ──
+    if args.quick_scan and args.device:
+        scanner_pre = CandidateScanner(
+            device=args.device,
+            read_chunk_mb=args.read_chunk,
+            page_types=[FIL_PAGE_INDEX, 0x000A, 0x000B, 0x000C],
+        )
+        start_bytes = args.offset * 1024 * 1024
+        length_bytes = args.length * 1024 * 1024 if args.length else 0
+        candidates = scanner_pre.quick_scan(
+            start_byte=start_bytes,
+            length_bytes=length_bytes,
+            workers=args.workers,
+        )
+
+        if candidates:
+            print(f"\n找到 {len(candidates)} 个候选 InnoDB 页。")
+            print(f"\n使用以下命令进行恢复（已自动建议 --offset 跳过无关区域）：")
+            first = candidates[0][0]
+            last  = candidates[-1][0]
+            start_mb = max(0, first // 1024 // 1024 - 100)
+            scan_len  = max(256, (last - first) // 1024 // 1024 + 200)
+            print(f"  python {sys.argv[0]} --device {args.device} \\")
+            print(f"      --schema <schema.json> \\")
+            print(f"      --offset {start_mb} --length {scan_len} \\")
+            print(f"      --workers {args.workers} --relaxed -o recovered.sql")
+            print(f"\n  候选页位置分布:")
+            seg_size = 1024 * 1024 * 1024
+            segs = {}
+            for off, pt, _ in candidates:
+                seg = off // seg_size
+                name = INNODB_PAGE_TYPES.get(pt, f'0x{pt:04X}')
+                segs[seg] = segs.get(seg, {})
+                segs[seg][name] = segs[seg].get(name, 0) + 1
+            for seg in sorted(segs):
+                types_str = ', '.join(f'{k}:{v}' for k, v in sorted(segs[seg].items()))
+                print(f"    {seg}-{seg+1} GB: {types_str}")
+        else:
+            print(f"\n未找到 InnoDB 页特征。可能原因：")
+            print(f"  1. 扫描范围 ({start_bytes/1024**2:.0f}-{(start_bytes+length_bytes)/1024**2:.0f} MB) 不含数据")
+            print(f"  2. 数据已被覆盖")
+            print(f"  3. 设备路径不正确")
+            print(f"\n建议：扩大扫描范围或确认正确设备")
+        return
+
     # ── 辅助：页信息 ──
     if args.page_info:
         if not args.ibd:
@@ -1438,13 +2268,72 @@ def main():
             print(f"{k:<25} {v:>8}")
         return
 
-    # ── 检查 schema ──
-    if not args.schema and not args.gen_schema:
+    # ── 检查 schema（--auto-schema 可从数据源自动提取）──
+    if not args.schema and not args.gen_schema and not args.auto_schema:
         parser.print_help()
-        print("\n错误: 需要 --schema 参数（或先用 --gen-schema 生成模板）")
+        print("\n错误: 需要 --schema 参数，或使用 --auto-schema 自动提取表结构")
+        print("提示: --auto-schema 从 MySQL 8.0 SDI 页自动获取表定义，无需手动写 schema.json")
         sys.exit(1)
 
-    table_name, row_format, columns = load_schema(args.schema)
+    # ── 加载/提取 schema ──
+    if args.auto_schema:
+        # 从 SDI 页自动提取表结构
+        if args.ibd:
+            logging.info(f"从 {args.ibd} 的 SDI 页提取表结构...")
+            result = SDIExtractor.extract_schema_from_file(args.ibd, args.table or '')
+        elif args.device:
+            logging.info(f"从 {args.device} 的 SDI 页提取表结构...")
+            result = SDIExtractor.extract_schema_from_device(
+                args.device, args.table or '',
+                offset_mb=args.offset, length_mb=args.length,
+                workers=args.workers,
+            )
+        elif args.rescue:
+            # rescue 模式先抢救 .ibd，再提取 schema
+            table_hint = args.table or 'recovered'
+            rescued_path = f'/tmp/rescued_{table_hint}.ibd'
+            rescued = ProcFdRescuer.rescue(rescued_path, table_hint)
+            if rescued is None:
+                logging.warning("rescue 失败，无法自动提取 schema")
+                print("\n无法获取数据源，请使用裸盘扫描：")
+                print(f"  python {sys.argv[0]} --detect-device")
+                print(f"  python {sys.argv[0]} --device /dev/vda3 --auto-schema --table {args.table or 'your_table'} -o recovered.sql")
+                sys.exit(1)
+            logging.info(f"从抢救的文件提取 schema: {rescued}")
+            result = SDIExtractor.extract_schema_from_file(rescued, args.table or '')
+        else:
+            logging.error("--auto-schema 需要配合 --ibd、--device 或 --rescue 使用")
+            sys.exit(1)
+
+        if result is None:
+            logging.error("SDI 提取失败。请手动创建 schema.json")
+            print()
+            print("可能原因：")
+            print("  1. .ibd 文件中没有 SDI 页（共享表空间或旧版本 MySQL）")
+            print("  2. 数据已被覆盖")
+            print("  3. 表名不匹配（用 --table 指定）")
+            print()
+            print("手动生成 schema 模板：")
+            print(f"  python {sys.argv[0]} --gen-schema your_table")
+            sys.exit(1)
+
+        table_name, row_format, cols_info = result
+        columns = SDIExtractor.columns_to_columndefs(cols_info)
+
+        # 可选：保存提取的 schema 到文件
+        if args.schema_out:
+            SDIExtractor.generate_schema_json(table_name, row_format, cols_info, args.schema_out)
+
+        logging.info(f"SDI 表结构: {table_name}  行格式: {row_format}  列数: {len(columns)}")
+        for ci in cols_info:
+            logging.debug(f"  {ci['name']}: {ci['type']} "
+                         f"{'UNSIGNED' if ci.get('unsigned') else ''} "
+                         f"{'NULL' if ci.get('nullable') else 'NOT NULL'}")
+
+    else:
+        # 从 JSON 文件加载 schema
+        table_name, row_format, columns = load_schema(args.schema)
+
     logging.info(f"表: {table_name}  行格式: {row_format}  列数: {len(columns)}")
 
     rows = []
@@ -1461,11 +2350,24 @@ def main():
         result = ProcFdRescuer.rescue(rescued_path, table_hint)
 
         if result is None:
-            print("\n/proc/fd 抢救失败。")
-            print("请检查：")
-            print("  1. mysqld 是否仍在运行（ps aux | grep mysqld）")
-            print("  2. 是否以 root 身份运行本工具")
-            print("  3. 若 mysqld 已重启，改用裸盘扫描：--device /dev/sdaX")
+            print()
+            print("=" * 60)
+            print("  /proc/fd 和 map_files 均未找到可恢复的数据")
+            print("=" * 60)
+            print()
+            print("原因: MySQL DROP TABLE 会立即关闭 .ibd 文件句柄并释放内存映射。")
+            print("      数据仍在磁盘上，只是文件系统元数据被释放了。")
+            print()
+            print("推荐方案 — 裸盘扫描 + 自动提取 schema：")
+            print(f"  1. 检测设备:    python {sys.argv[0]} --detect-device")
+            print(f"  2. 快速预扫描:  python {sys.argv[0]} --device /dev/vda3 --quick-scan --workers 8")
+            print(f"  3. 自动恢复:    python {sys.argv[0]} --device /dev/vda3 \\")
+            print(f"                      --auto-schema --table {table_hint} \\")
+            print(f"                      --workers 8 --relaxed -o recovered.sql")
+            print()
+            print("如果知道设备路径，也可一步完成：")
+            print(f"  python {sys.argv[0]} --device /dev/vda3 --auto-schema \\")
+            print(f"      --table {table_hint} --workers 8 --relaxed -o recovered.sql")
             sys.exit(1)
 
         logging.info(f"使用抢救的文件继续扫描: {rescued_path}")
@@ -1495,13 +2397,14 @@ def main():
             include_deleted=not args.no_deleted,
             space_id=args.space_id,
             read_chunk_mb=args.read_chunk,
+            workers=args.workers,
+            relaxed=args.relaxed,
         )
 
         if args.offset or args.length:
             start_bytes  = args.offset * 1024 * 1024
-            length_bytes = args.length * 1024 * 1024 if args.length else None
-            if length_bytes is None:
-                # 扫描到设备末尾
+            length_bytes = args.length * 1024 * 1024 if args.length else 0
+            if length_bytes <= 0:
                 dev_size = os.path.getsize(args.device)
                 length_bytes = dev_size - start_bytes
             rows = scanner_dev.scan_range(start_bytes, length_bytes)
@@ -1546,7 +2449,9 @@ def main():
     if not rows:
         logging.warning("未恢复到任何记录。建议：")
         logging.warning("  - 若使用 --ibd，尝试加 --brute-force")
-        logging.warning("  - 若使用 --device，尝试指定 --space-id 或 --offset/--length 缩小范围")
+        logging.warning("  - 若使用 --device，先用 --quick-scan 预扫描定位候选页")
+        logging.warning("  - 若使用 --device，加 --relaxed 放宽检测条件")
+        logging.warning("  - 指定 --space-id 或 --offset/--length 缩小范围（预扫描会给出建议）")
 
     # ── 输出 ──
     writer = OutputWriter(table_name, columns)
