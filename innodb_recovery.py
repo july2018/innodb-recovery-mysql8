@@ -35,12 +35,14 @@ Usage:
 import struct
 import sys
 import os
+import glob
 import json
 import argparse
 import datetime
 import binascii
 import logging
-from typing import Optional, List, Dict, Tuple, Any
+import subprocess
+from typing import Optional, List, Dict, Tuple, Any, Iterator
 
 # ─────────────────────────────────────────────────────────────────
 # 常量：来自 MySQL 8.0 源码
@@ -900,6 +902,314 @@ class IBDScanner:
 
 
 # ─────────────────────────────────────────────────────────────────
+# /proc/fd 抢救器：DROP TABLE 后 MySQL 进程仍持有文件句柄时使用
+# ─────────────────────────────────────────────────────────────────
+
+class ProcFdRescuer:
+    """
+    DROP TABLE 后文件已从目录项删除，但若 mysqld 进程仍运行，
+    内核仍保留文件数据（文件引用计数 > 0）。
+    通过 /proc/<pid>/fd/<n> → (deleted) 找到句柄，直接读取字节流。
+    仅限 Linux。
+    """
+
+    @staticmethod
+    def find_mysqld_pids() -> List[int]:
+        """返回所有 mysqld 进程的 PID 列表"""
+        pids = []
+        try:
+            out = subprocess.check_output(['pgrep', '-x', 'mysqld'],
+                                          stderr=subprocess.DEVNULL).decode()
+            pids = [int(p) for p in out.split() if p.strip().isdigit()]
+        except Exception:
+            pass
+        if not pids:
+            # 备用方案：扫描 /proc
+            for entry in os.listdir('/proc'):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f'/proc/{entry}/comm') as f:
+                        if f.read().strip() in ('mysqld', 'mysqld_safe'):
+                            pids.append(int(entry))
+                except Exception:
+                    pass
+        return pids
+
+    @staticmethod
+    def find_deleted_ibd(pid: int, table_hint: str = '') -> List[Tuple[str, str]]:
+        """
+        扫描 /proc/<pid>/fd，找到已删除的 .ibd 文件句柄。
+        返回 [(fd_path, original_name), ...]
+        """
+        results = []
+        fd_dir = f'/proc/{pid}/fd'
+        try:
+            for fd in os.listdir(fd_dir):
+                fd_path = f'{fd_dir}/{fd}'
+                try:
+                    target = os.readlink(fd_path)
+                    if ' (deleted)' in target and '.ibd' in target:
+                        if table_hint and table_hint.lower() not in target.lower():
+                            continue
+                        results.append((fd_path, target.replace(' (deleted)', '')))
+                except Exception:
+                    pass
+        except PermissionError:
+            logging.error(f"无权限读取 /proc/{pid}/fd，请用 root 运行")
+        return results
+
+    @classmethod
+    def rescue(cls, output_path: str, table_hint: str = '') -> Optional[str]:
+        """
+        自动找到被删除的 .ibd 并保存到 output_path。
+        成功返回 output_path，失败返回 None。
+        """
+        pids = cls.find_mysqld_pids()
+        if not pids:
+            logging.warning("/proc/fd 方案：未找到 mysqld 进程")
+            return None
+
+        for pid in pids:
+            deleted = cls.find_deleted_ibd(pid, table_hint)
+            if not deleted:
+                continue
+
+            logging.info(f"mysqld PID={pid} 持有 {len(deleted)} 个已删除 .ibd 句柄")
+            for fd_path, orig_name in deleted:
+                print(f"  [found] {orig_name}")
+
+            if len(deleted) > 1 and not table_hint:
+                print("发现多个已删除 .ibd，请用 --table 指定表名过滤，例如：")
+                for _, orig in deleted:
+                    print(f"  --table {os.path.basename(orig).replace('.ibd','')}")
+                return None
+
+            fd_path, orig_name = deleted[0]
+            logging.info(f"从 {fd_path} 读取数据 → {output_path}")
+            try:
+                size = 0
+                with open(fd_path, 'rb') as src, open(output_path, 'wb') as dst:
+                    while True:
+                        chunk = src.read(4 * 1024 * 1024)  # 4MB 块
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        size += len(chunk)
+                logging.info(f"抢救完成：{size / 1024 / 1024:.1f} MB → {output_path}")
+                return output_path
+            except PermissionError:
+                logging.error("读取 /proc/fd 失败：需要 root 权限")
+                return None
+            except Exception as e:
+                logging.error(f"读取失败：{e}")
+                return None
+
+        logging.warning("在 mysqld 进程中未找到已删除的 .ibd 文件句柄")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+# 裸块设备扫描器：DROP TABLE 且 mysqld 已重启时使用
+# ─────────────────────────────────────────────────────────────────
+
+class RawDeviceScanner:
+    """
+    直接扫描块设备（/dev/sda1、/dev/vda3 等）或磁盘镜像文件，
+    按 UNIV_PAGE_SIZE(16KB) 步长寻找 InnoDB FIL_PAGE_INDEX 页，
+    不依赖 .ibd 文件存在。
+
+    这是 undrop-for-innodb 的核心思路：
+      文件删除 → 目录项消失 → 磁盘块仍保留 → 按特征扫描
+    """
+
+    # InnoDB 页特征：偏移 24-25 为页类型
+    PAGE_TYPE_OFFSET = FIL_PAGE_TYPE   # 24
+
+    def __init__(self, device: str, columns: List[ColumnDef],
+                 row_format: str = 'DYNAMIC',
+                 include_deleted: bool = True,
+                 space_id: int = 0,
+                 read_chunk_mb: int = 64):
+        self.device = device
+        self.columns = columns
+        self.row_format = row_format.upper()
+        self.include_deleted = include_deleted
+        self.space_id = space_id           # 0 = 不过滤 space_id
+        self.chunk_size = read_chunk_mb * 1024 * 1024
+
+        if not os.path.exists(device):
+            raise FileNotFoundError(f"设备/文件不存在: {device}")
+
+    def _iter_pages(self) -> Iterator[Tuple[int, bytes]]:
+        """
+        按 16KB 步长遍历设备/文件，yield (page_offset_bytes, raw_bytes)。
+        使用大块读取减少 I/O 次数。
+        """
+        page_sz = UNIV_PAGE_SIZE
+        buf_pages = self.chunk_size // page_sz
+
+        with open(self.device, 'rb') as f:
+            offset = 0
+            while True:
+                chunk = f.read(buf_pages * page_sz)
+                if not chunk:
+                    break
+                n = len(chunk) // page_sz
+                for i in range(n):
+                    yield offset + i * page_sz, chunk[i * page_sz:(i + 1) * page_sz]
+                offset += n * page_sz
+
+    def _is_innodb_index_page(self, raw: bytes) -> bool:
+        """快速判断是否为 InnoDB INDEX 叶子页"""
+        if len(raw) < UNIV_PAGE_SIZE:
+            return False
+        page_type = read_u16_be(raw, FIL_PAGE_TYPE)
+        if page_type != FIL_PAGE_INDEX:
+            return False
+        # 过滤 space_id
+        if self.space_id:
+            sid = struct.unpack_from('>I', raw, FIL_PAGE_ARCH_LOG_NO)[0]
+            if sid != self.space_id:
+                return False
+        # 必须是叶子页（level == 0）
+        level = read_u16_be(raw, FIL_PAGE_DATA + PAGE_LEVEL)
+        if level != 0:
+            return False
+        # N_HEAP 合法性（bit15 = compact flag）
+        n_heap = read_u16_be(raw, FIL_PAGE_DATA + PAGE_N_HEAP) & 0x7FFF
+        if n_heap < 2 or n_heap > 2000:
+            return False
+        return True
+
+    def scan(self) -> List[Dict]:
+        """
+        扫描整个设备，返回所有恢复的行。
+        """
+        all_rows = []
+        seen_keys = set()
+        pages_checked = 0
+        pages_matched = 0
+
+        logging.info(f"裸盘扫描: {self.device}，行格式: {self.row_format}")
+        logging.info("注意：扫描大磁盘可能需要数分钟到数小时，建议指定 --offset / --length 缩小范围")
+
+        for byte_offset, raw in self._iter_pages():
+            pages_checked += 1
+            if pages_checked % 100000 == 0:
+                gb = byte_offset / 1024**3
+                logging.info(f"已扫描 {gb:.2f} GB，匹配页: {pages_matched}，"
+                             f"已恢复: {len(all_rows)} 条")
+
+            if not self._is_innodb_index_page(raw):
+                continue
+
+            pages_matched += 1
+            page_no_in_file = byte_offset // UNIV_PAGE_SIZE
+
+            try:
+                page = InnoDBPage(raw, page_no_in_file)
+                parser = RecordParser(page, self.columns,
+                                      include_deleted=self.include_deleted)
+                rows = parser.scan_page()
+                if not rows:
+                    rows = parser.scan_page_brute_force()
+
+                for r in rows:
+                    key = IBDScanner._row_key(r['row'])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        r['page_no'] = page_no_in_file
+                        r['device_offset'] = byte_offset
+                        all_rows.append(r)
+            except Exception as e:
+                logging.debug(f"解析页 offset={byte_offset} 失败: {e}")
+
+        logging.info(f"裸盘扫描完成：检查 {pages_checked} 页，"
+                     f"匹配 {pages_matched} 个 INDEX 页，"
+                     f"恢复 {len(all_rows)} 条记录")
+        return all_rows
+
+    def scan_range(self, start_byte: int, length_bytes: int) -> List[Dict]:
+        """
+        只扫描指定字节范围（用于缩小范围、加速）。
+        start_byte 和 length_bytes 都需要是 16384 的倍数。
+        """
+        all_rows = []
+        seen_keys = set()
+        page_sz = UNIV_PAGE_SIZE
+        start_page = start_byte // page_sz
+        end_page   = (start_byte + length_bytes) // page_sz
+
+        logging.info(f"范围扫描: offset={start_byte}({start_byte//1024//1024}MB) "
+                     f"length={length_bytes//1024//1024}MB")
+
+        with open(self.device, 'rb') as f:
+            f.seek(start_byte)
+            for pg in range(start_page, end_page):
+                raw = f.read(page_sz)
+                if len(raw) < page_sz:
+                    break
+                if not self._is_innodb_index_page(raw):
+                    continue
+                try:
+                    page = InnoDBPage(raw, pg)
+                    parser = RecordParser(page, self.columns,
+                                         include_deleted=self.include_deleted)
+                    rows = parser.scan_page()
+                    if not rows:
+                        rows = parser.scan_page_brute_force()
+                    for r in rows:
+                        key = IBDScanner._row_key(r['row'])
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            r['page_no'] = pg
+                            all_rows.append(r)
+                except Exception:
+                    pass
+
+        logging.info(f"范围扫描完成，恢复 {len(all_rows)} 条")
+        return all_rows
+
+
+def detect_mysql_datadir() -> str:
+    """尝试自动检测 MySQL 数据目录"""
+    candidates = [
+        '/var/lib/mysql',
+        '/usr/local/mysql/data',
+        '/data/mysql',
+        '/opt/mysql/data',
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    # 尝试从运行进程读取
+    try:
+        out = subprocess.check_output(
+            ['mysql', '-e', 'SELECT @@datadir', '-s', '--skip-column-names'],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if out and os.path.isdir(out):
+            return out
+    except Exception:
+        pass
+    return ''
+
+
+def detect_device_of_path(path: str) -> str:
+    """找到 path 所在的块设备（Linux）"""
+    try:
+        out = subprocess.check_output(['df', '--output=source', path],
+                                      stderr=subprocess.DEVNULL).decode()
+        lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+        if len(lines) >= 2:
+            return lines[1]
+    except Exception:
+        pass
+    return ''
+
+
+# ─────────────────────────────────────────────────────────────────
 # 输出格式化
 # ─────────────────────────────────────────────────────────────────
 
@@ -997,44 +1307,78 @@ def generate_schema_template(table_name: str, output_path: str):
 def main():
     parser = argparse.ArgumentParser(
         description='InnoDB Recovery Tool for MySQL 8.0\n'
-                    '模仿 undrop-for-innodb，支持从 .ibd 文件恢复数据',
+                    '支持三种恢复模式：.ibd文件 / /proc/fd抢救 / 裸块设备扫描',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  # 生成 schema 模板
+恢复场景与命令示例：
+
+【场景1】DROP TABLE / DELETE 后 .ibd 仍存在（文件未被覆盖）：
+  python innodb_recovery.py --ibd orders.ibd --schema schema.json --brute-force -o out.sql
+
+【场景2】DROP TABLE 后 mysqld 进程仍在运行（/proc/fd 抢救，成功率最高）：
+  python innodb_recovery.py --rescue --table orders --schema schema.json -o out.sql
+  # 工具自动从 /proc/<mysqld_pid>/fd 读取已删除文件，无需 .ibd 存在
+
+【场景3】mysqld 已重启 / .ibd 已删除，扫描裸块设备（需 root）：
+  python innodb_recovery.py --device /dev/sda1 --schema schema.json -o out.sql
+  # 扫描大磁盘时可加 --offset / --length 缩小范围（单位 MB）
+  python innodb_recovery.py --device /dev/sda1 --schema schema.json \\
+      --offset 10240 --length 20480 -o out.sql
+
+【其他】
+  # 生成表结构模板
   python innodb_recovery.py --gen-schema orders --schema-out schema.json
 
-  # 恢复数据（包含软删除记录）
-  python innodb_recovery.py --ibd orders.ibd --schema schema.json -o output.sql
+  # 查看页分布（.ibd 存在时）
+  python innodb_recovery.py --ibd orders.ibd --page-info
 
-  # 仅恢复活跃记录，输出 CSV
-  python innodb_recovery.py --ibd orders.ibd --schema schema.json --no-deleted --format csv -o output.csv
+  # 自动检测 MySQL 数据目录所在磁盘（辅助信息）
+  python innodb_recovery.py --detect-device
 
-  # 暴力扫描（链表被破坏时）
-  python innodb_recovery.py --ibd orders.ibd --schema schema.json --brute-force -o output.sql
-
-  # 扫描系统表空间（ibdata1 需用 --system）
-  python innodb_recovery.py --ibd ibdata1 --schema schema.json --system -o output.sql
+注意：裸盘扫描和 /proc/fd 抢救均需 root 权限。
         """
     )
-    parser.add_argument('--ibd',         help='.ibd 文件路径（或 ibdata1）')
-    parser.add_argument('--schema',      help='表结构 JSON 文件路径')
+
+    # ── 数据源（三选一）──
+    src_group = parser.add_mutually_exclusive_group()
+    src_group.add_argument('--ibd',    help='.ibd 文件路径（或 ibdata1）')
+    src_group.add_argument('--device', help='裸块设备路径，如 /dev/sda1（需 root）')
+    src_group.add_argument('--rescue', action='store_true',
+                           help='从 /proc/fd 抢救被 DROP 的表（mysqld 必须在运行，需 root）')
+
+    # ── 通用参数 ──
+    parser.add_argument('--schema',   help='表结构 JSON 文件路径')
+    parser.add_argument('--table',    help='表名（用于 --rescue 时过滤，或生成输出文件名）')
     parser.add_argument('-o', '--output', help='输出文件路径（默认 stdout）')
-    parser.add_argument('--format',      choices=['sql', 'csv', 'json'],
-                        default='sql',   help='输出格式（默认 sql）')
-    parser.add_argument('--no-deleted',  action='store_true',
+    parser.add_argument('--format',   choices=['sql', 'csv', 'json'],
+                        default='sql', help='输出格式（默认 sql）')
+    parser.add_argument('--no-deleted', action='store_true',
                         help='不输出 delete-marked 记录')
     parser.add_argument('--brute-force', action='store_true',
                         help='暴力扫描模式（链表被破坏时使用）')
-    parser.add_argument('--index-id',    type=int, default=0,
-                        help='只扫描指定 index_id 的页（默认扫描所有）')
-    parser.add_argument('--gen-schema',  metavar='TABLE_NAME',
-                        help='生成 schema 模板，不执行恢复')
-    parser.add_argument('--schema-out',  default='schema_template.json',
-                        help='schema 模板输出路径（配合 --gen-schema）')
-    parser.add_argument('--page-info',   action='store_true',
-                        help='打印 .ibd 文件页类型统计信息')
-    parser.add_argument('--system',      action='store_true',
+    parser.add_argument('--index-id', type=int, default=0,
+                        help='只扫描指定 index_id 的页')
+
+    # ── 裸盘专用参数 ──
+    parser.add_argument('--offset',   type=int, default=0,
+                        help='裸盘扫描起始位置（MB，默认从头开始）')
+    parser.add_argument('--length',   type=int, default=0,
+                        help='裸盘扫描长度（MB，默认扫描全部）')
+    parser.add_argument('--space-id', type=int, default=0,
+                        help='只匹配指定 InnoDB space_id 的页（0=不过滤）')
+    parser.add_argument('--read-chunk', type=int, default=64,
+                        help='裸盘每次读取块大小（MB，默认64）')
+
+    # ── 辅助命令 ──
+    parser.add_argument('--gen-schema', metavar='TABLE_NAME',
+                        help='生成 schema 模板')
+    parser.add_argument('--schema-out', default='schema_template.json',
+                        help='schema 模板输出路径')
+    parser.add_argument('--page-info',  action='store_true',
+                        help='打印 .ibd 文件页类型统计（需 --ibd）')
+    parser.add_argument('--detect-device', action='store_true',
+                        help='自动检测 MySQL 数据目录所在块设备')
+    parser.add_argument('--system',    action='store_true',
                         help='扫描系统表空间（ibdata1）')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='详细日志')
@@ -1045,12 +1389,23 @@ def main():
         format='%(asctime)s %(levelname)s %(message)s'
     )
 
-    # ── 生成 schema 模板 ──
+    # ── 辅助：生成 schema 模板 ──
     if args.gen_schema:
         generate_schema_template(args.gen_schema, args.schema_out)
         return
 
-    # ── 打印页信息 ──
+    # ── 辅助：检测设备 ──
+    if args.detect_device:
+        datadir = detect_mysql_datadir()
+        if datadir:
+            dev = detect_device_of_path(datadir)
+            print(f"MySQL 数据目录: {datadir}")
+            print(f"所在块设备:     {dev if dev else '(无法自动检测，请手动运行 df -h /var/lib/mysql)'}")
+        else:
+            print("未能自动检测 MySQL 数据目录，请手动运行：df -h /var/lib/mysql")
+        return
+
+    # ── 辅助：页信息 ──
     if args.page_info:
         if not args.ibd:
             print("需要 --ibd 参数")
@@ -1083,32 +1438,115 @@ def main():
             print(f"{k:<25} {v:>8}")
         return
 
-    # ── 参数检查 ──
-    if not args.ibd:
+    # ── 检查 schema ──
+    if not args.schema and not args.gen_schema:
         parser.print_help()
-        sys.exit(1)
-    if not args.schema:
-        print("错误: 需要 --schema 参数指定表结构文件")
-        print("提示: 使用 --gen-schema <表名> 生成模板")
+        print("\n错误: 需要 --schema 参数（或先用 --gen-schema 生成模板）")
         sys.exit(1)
 
-    # ── 加载 schema ──
     table_name, row_format, columns = load_schema(args.schema)
     logging.info(f"表: {table_name}  行格式: {row_format}  列数: {len(columns)}")
 
-    # ── 扫描 ──
-    scanner = IBDScanner(
-        ibd_path=args.ibd,
-        columns=columns,
-        row_format=row_format,
-        include_deleted=not args.no_deleted,
-        brute_force=args.brute_force,
-        target_index_id=args.index_id,
-    )
-    rows = scanner.scan()
+    rows = []
+
+    # ════════════════════════════════════════════════════════════
+    # 模式 A：/proc/fd 抢救（mysqld 仍在运行）
+    # ════════════════════════════════════════════════════════════
+    if args.rescue:
+        if os.geteuid() != 0:
+            logging.warning("建议以 root 运行以访问 /proc/<mysqld_pid>/fd")
+
+        table_hint = args.table or table_name
+        rescued_path = f'/tmp/rescued_{table_hint}.ibd'
+        result = ProcFdRescuer.rescue(rescued_path, table_hint)
+
+        if result is None:
+            print("\n/proc/fd 抢救失败。")
+            print("请检查：")
+            print("  1. mysqld 是否仍在运行（ps aux | grep mysqld）")
+            print("  2. 是否以 root 身份运行本工具")
+            print("  3. 若 mysqld 已重启，改用裸盘扫描：--device /dev/sdaX")
+            sys.exit(1)
+
+        logging.info(f"使用抢救的文件继续扫描: {rescued_path}")
+        scanner = IBDScanner(
+            ibd_path=rescued_path,
+            columns=columns,
+            row_format=row_format,
+            include_deleted=not args.no_deleted,
+            brute_force=True,   # 抢救的文件强制暴力扫描
+            target_index_id=args.index_id,
+        )
+        rows = scanner.scan()
+
+    # ════════════════════════════════════════════════════════════
+    # 模式 B：裸块设备扫描
+    # ════════════════════════════════════════════════════════════
+    elif args.device:
+        if not os.path.exists(args.device):
+            print(f"错误: 设备不存在: {args.device}")
+            print("提示: 运行 --detect-device 自动检测正确的设备路径")
+            sys.exit(1)
+
+        scanner_dev = RawDeviceScanner(
+            device=args.device,
+            columns=columns,
+            row_format=row_format,
+            include_deleted=not args.no_deleted,
+            space_id=args.space_id,
+            read_chunk_mb=args.read_chunk,
+        )
+
+        if args.offset or args.length:
+            start_bytes  = args.offset * 1024 * 1024
+            length_bytes = args.length * 1024 * 1024 if args.length else None
+            if length_bytes is None:
+                # 扫描到设备末尾
+                dev_size = os.path.getsize(args.device)
+                length_bytes = dev_size - start_bytes
+            rows = scanner_dev.scan_range(start_bytes, length_bytes)
+        else:
+            rows = scanner_dev.scan()
+
+    # ════════════════════════════════════════════════════════════
+    # 模式 C：.ibd 文件扫描（原有逻辑）
+    # ════════════════════════════════════════════════════════════
+    elif args.ibd:
+        if not os.path.exists(args.ibd):
+            print(f"错误: 文件不存在: {args.ibd}")
+            print()
+            print("DROP TABLE 后 .ibd 文件已被删除，有以下恢复方案：")
+            print()
+            print("  方案1（推荐）- mysqld 仍在运行时，从 /proc/fd 抢救：")
+            print(f"    python {sys.argv[0]} --rescue --table {os.path.basename(args.ibd).replace('.ibd','')} --schema {args.schema or 'schema.json'} -o out.sql")
+            print()
+            print("  方案2 - mysqld 已重启，扫描裸块设备（需 root）：")
+            datadir = detect_mysql_datadir()
+            dev = detect_device_of_path(datadir) if datadir else '/dev/sda1'
+            print(f"    python {sys.argv[0]} --device {dev} --schema {args.schema or 'schema.json'} -o out.sql")
+            print()
+            print("  如不确定设备，先运行：")
+            print(f"    python {sys.argv[0]} --detect-device")
+            sys.exit(1)
+
+        scanner = IBDScanner(
+            ibd_path=args.ibd,
+            columns=columns,
+            row_format=row_format,
+            include_deleted=not args.no_deleted,
+            brute_force=args.brute_force,
+            target_index_id=args.index_id,
+        )
+        rows = scanner.scan()
+
+    else:
+        parser.print_help()
+        sys.exit(1)
 
     if not rows:
-        logging.warning("未恢复到任何记录。建议尝试 --brute-force 模式。")
+        logging.warning("未恢复到任何记录。建议：")
+        logging.warning("  - 若使用 --ibd，尝试加 --brute-force")
+        logging.warning("  - 若使用 --device，尝试指定 --space-id 或 --offset/--length 缩小范围")
 
     # ── 输出 ──
     writer = OutputWriter(table_name, columns)
@@ -1122,7 +1560,7 @@ def main():
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
             f.write(content)
-        logging.info(f"结果已写入: {args.output}")
+        logging.info(f"结果已写入: {args.output}  共 {len(rows)} 条记录")
     else:
         print(content)
 
