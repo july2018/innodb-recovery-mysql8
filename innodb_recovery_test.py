@@ -16,19 +16,20 @@ import struct
 import os
 import sys
 import json
+import zlib
 import tempfile
 import logging
 
 # 把工具目录加入 path
 sys.path.insert(0, os.path.dirname(__file__))
 from innodb_recovery import (
-    UNIV_PAGE_SIZE, FIL_PAGE_TYPE, FIL_PAGE_INDEX,
+    UNIV_PAGE_SIZE, FIL_PAGE_TYPE, FIL_PAGE_INDEX, FIL_PAGE_SDI,
     FIL_PAGE_DATA, PAGE_HEADER_SIZE, PAGE_N_HEAP,
     PAGE_HEAP_TOP, PAGE_LEVEL, PAGE_INDEX_ID,
     REC_N_NEW_EXTRA_BYTES, REC_INFO_DELETED_FLAG,
     REC_STATUS_ORDINARY, REC_STATUS_INFIMUM, REC_STATUS_SUPREMUM,
     InnoDBPage, RecordParser, ColumnDef, IBDScanner, OutputWriter,
-    load_schema
+    load_schema, SDIExtractor
 )
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(message)s')
@@ -316,6 +317,87 @@ def run_tests():
     j = json.loads(writer.to_json(all_rows))
     assert len(j) == 3
     print("PASS: JSON output test")
+
+    # ── SDI extraction test ──
+    print()
+    sdi_json = {
+        "sdi_version": 80019,
+        "dd_object_type": "Table",
+        "dd_object": {
+            "name": "test_table",
+            "row_format": 2,
+            "columns": [
+                {"name": "id", "type": 8, "is_nullable": False, "is_unsigned": True,
+                 "char_length": 20, "numeric_precision": 0, "collation_id": 0},
+                {"name": "name", "type": 15, "is_nullable": True, "is_unsigned": False,
+                 "char_length": 64, "collation_id": 45},
+                {"name": "score", "type": 3, "is_nullable": True, "is_unsigned": False,
+                 "char_length": 11, "numeric_precision": 0, "collation_id": 0},
+            ]
+        }
+    }
+    raw_json = json.dumps(sdi_json).encode('utf-8')
+    compressed = zlib.compress(raw_json)
+
+    # 构造一个包含 SDI 数据的 16KB 页
+    sdi_page = bytearray(UNIV_PAGE_SIZE)
+    struct.pack_into('>H', sdi_page, FIL_PAGE_TYPE, FIL_PAGE_SDI)
+    # 将压缩数据写入页数据区
+    sdi_page[FIL_PAGE_DATA: FIL_PAGE_DATA + len(compressed)] = compressed
+
+    # 测试解压
+    decompressed = SDIExtractor._decompress_sdi(bytes(sdi_page))
+    assert decompressed is not None, "SDI decompression failed"
+    print(f"SDI decompressed: {len(decompressed)} chars")
+    print(f"  Preview: {decompressed[:80]}...")
+
+    # 测试解析
+    result = SDIExtractor._parse_sdi_columns(json.loads(decompressed))
+    assert result is not None, "SDI parse failed"
+    table_name, row_format, cols_info = result
+    assert table_name == 'test_table'
+    assert row_format == 'DYNAMIC'
+    assert len(cols_info) == 3
+    assert cols_info[0]['name'] == 'id'
+    assert cols_info[0]['type'] == 'bigint'
+    assert cols_info[0]['unsigned'] == True
+    assert cols_info[1]['name'] == 'name'
+    assert cols_info[1]['type'] == 'varchar(64)'
+    assert cols_info[2]['name'] == 'score'
+    assert cols_info[2]['type'] == 'int'
+    print(f"  Parsed: {table_name} ({row_format}), {len(cols_info)} columns")
+    for ci in cols_info:
+        print(f"    {ci['name']}: {ci['type']} unsigned={ci.get('unsigned')} nullable={ci.get('nullable')}")
+
+    # 测试转 ColumnDef
+    coldefs = SDIExtractor.columns_to_columndefs(cols_info)
+    assert len(coldefs) == 3
+    assert coldefs[0].name == 'id'
+    assert coldefs[0].unsigned == True
+    assert coldefs[0].fixed_len == 8
+    assert coldefs[1].name == 'name'
+    assert coldefs[1].max_len == 64
+    print("PASS: SDI extraction test")
+
+    # ── SDI from file test ──
+    with tempfile.NamedTemporaryFile(suffix='.ibd', delete=False) as f:
+        # 页0: SDI page
+        f.write(bytes(sdi_page))
+        tmp_sdi = f.name
+
+    result2 = SDIExtractor.extract_schema_from_file(tmp_sdi, 'test_table')
+    assert result2 is not None, "SDI extract from file failed"
+    tn, rf, ci = result2
+    assert tn == 'test_table'
+    assert rf == 'DYNAMIC'
+    print(f"PASS: SDI extract from file: {tn} ({rf}), {len(ci)} columns")
+
+    # 测试 filter
+    result3 = SDIExtractor.extract_schema_from_file(tmp_sdi, 'nonexistent')
+    assert result3 is None, "Should not match nonexistent table"
+    print("PASS: SDI table filter test")
+
+    os.unlink(tmp_sdi)
 
     print("\n" + "=" * 60)
     print("All tests passed!")
